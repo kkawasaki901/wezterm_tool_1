@@ -1,0 +1,1682 @@
+了解。いま貼った最新版を「最終版」として、**これまでの改善を全部反映した“全文（全ファイル）”**と、**使い方の詳細**をまとめて出します。
+（Rustプロジェクトとしてそのままコピペで組める形です）
+
+---
+
+# ✅ 最終版：全文（全ファイル）
+
+## Cargo.toml
+
+```toml
+[package]
+name = "todo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+slug = "0.1"
+dirs = "5"
+toml = "0.8"
+```
+
+---
+
+## src/cli.rs
+
+```rust
+use clap::{Parser, Subcommand};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "todo",
+    version,
+    about = "TODO CLI (1 file = 1 todo, Markdown + YAML frontmatter)",
+    long_about = "A simple TODO manager where each TODO is stored as a Markdown file with YAML frontmatter.\n\
+                  Default root: ~/todo\n\
+                  Directories: active/, done/YYYY/MM/, canceled/YYYY/MM/, templates/\n\
+                  Tip: done/start/wait/cancel/reopen support fzf selection when no argument is given.\n\
+                  Tip: In fzf, Ctrl-O opens the selected file in $EDITOR (if available).\n\
+                  Tip: todo fix-broken helps repair files quarantined in done/broken or canceled/broken."
+)]
+pub struct Args {
+    #[command(subcommand)]
+    pub cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Cmd {
+    /// Create new todo
+    Add {
+        /// Title (optional if --edit)
+        title: Option<String>,
+
+        /// Due date: YYYY-MM-DD or RFC3339 datetime (e.g. 2026-01-10 or 2026-01-10T18:00+09:00)
+        #[arg(long)]
+        due: Option<String>,
+
+        /// Tags (comma-separated): --tags work,mail
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Importance 1..5 (default: 3)
+        #[arg(long, default_value_t = 3)]
+        importance: i32,
+
+        /// Open in $EDITOR after creation
+        #[arg(long)]
+        edit: bool,
+
+        /// Custom slug for filename
+        #[arg(long)]
+        slug: Option<String>,
+    },
+
+    /// List todos (default: active only, status in todo|doing|waiting)
+    List {
+        /// Due within: e.g. 14d
+        #[arg(long)]
+        due_within: Option<String>,
+
+        /// Due from (inclusive): YYYY-MM-DD or RFC3339
+        #[arg(long)]
+        due_from: Option<String>,
+
+        /// Due to (inclusive): YYYY-MM-DD or RFC3339
+        #[arg(long)]
+        due_to: Option<String>,
+
+        /// Filter by a single tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Filter by status: todo|doing|waiting|done|canceled
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Importance filter: e.g. >=4, <3, =5, or 3
+        #[arg(long)]
+        importance: Option<String>,
+
+        /// Text query (uses rg if available, else fallback search)
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Include overdue items when using --due-within
+        #[arg(long)]
+        include_overdue: bool,
+    },
+
+    /// Show a todo file (id or id prefix). If multiple matches, fzf will be used if available.
+    Show { id_or_prefix: String },
+
+    /// Edit a todo file in $EDITOR and update updated_at automatically.
+    /// If multiple matches, fzf will be used if available.
+    Edit { id_or_prefix: String },
+
+    /// Mark as doing (status=doing). If no argument is provided, fzf-select from ACTIVE todos.
+    Start { id_or_prefix: Option<String> },
+
+    /// Mark as waiting (status=waiting). If no argument is provided, fzf-select from ACTIVE todos.
+    Wait { id_or_prefix: Option<String> },
+
+    /// Mark as done (status=done, done_at=now). If no argument is provided, fzf-select from ACTIVE todos.
+    Done { id_or_prefix: Option<String> },
+
+    /// Cancel (status=canceled, done_at=now). If no argument is provided, fzf-select from ACTIVE todos.
+    Cancel { id_or_prefix: Option<String> },
+
+    /// Reopen (status=todo, done_at cleared).
+    /// - No argument: fzf-select from CLOSED (done/canceled) todos (includes archived).
+    /// - With argument: must be done/canceled or it will be rejected (includes archived).
+    Reopen { id_or_prefix: Option<String> },
+
+    /// Move done/canceled files from active/ to done/YYYY/MM or canceled/YYYY/MM
+    /// and also reorganize archive (including restoring active-status files, quarantining broken files)
+    Archive,
+
+    /// Fix quarantined files in done/broken or canceled/broken
+    /// - Choose a file via fzf (with preview)
+    /// - Open in $EDITOR
+    /// - If it becomes valid, auto-place it into active/ or done/canceled YYYY/MM
+    FixBroken,
+}
+```
+
+---
+
+## src/config.rs
+
+```rust
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub root_dir: PathBuf,
+    pub soon_days: i64,
+    pub editor: String,
+    pub archive: bool,
+    pub auto_archive: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            root_dir: home.join("todo"),
+            soon_days: 7,
+            editor: std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string()),
+            archive: true,
+            auto_archive: false,
+        }
+    }
+}
+
+impl Config {
+    pub fn load() -> Self {
+        let mut cfg = Config::default();
+        if let Some(mut path) = dirs::config_dir() {
+            path.push("todo");
+            path.push("config.toml");
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                if let Ok(user_cfg) = toml::from_str::<Config>(&s) {
+                    cfg = user_cfg;
+                }
+            }
+        }
+        cfg
+    }
+
+    pub fn active_dir(&self) -> PathBuf { self.root_dir.join("active") }
+    pub fn done_dir(&self) -> PathBuf { self.root_dir.join("done") }
+    pub fn canceled_dir(&self) -> PathBuf { self.root_dir.join("canceled") }
+    pub fn templates_dir(&self) -> PathBuf { self.root_dir.join("templates") }
+    pub fn template_path(&self) -> PathBuf { self.templates_dir().join("todo.md") }
+}
+```
+
+---
+
+## src/model.rs
+
+```rust
+use anyhow::{anyhow, Error};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Todo,
+    Doing,
+    Waiting,
+    Done,
+    Canceled,
+}
+
+impl Status {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Status::Todo | Status::Doing | Status::Waiting)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Todo => "todo",
+            Status::Doing => "doing",
+            Status::Waiting => "waiting",
+            Status::Done => "done",
+            Status::Canceled => "canceled",
+        }
+    }
+}
+
+impl std::str::FromStr for Status {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim().to_lowercase();
+        match s.as_str() {
+            "todo" => Ok(Status::Todo),
+            "doing" => Ok(Status::Doing),
+            "waiting" => Ok(Status::Waiting),
+            "done" => Ok(Status::Done),
+            "canceled" | "cancelled" => Ok(Status::Canceled),
+            _ => Err(anyhow!("invalid status: {}", s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontMatter {
+    pub id: String,
+    pub title: String,
+    pub status: Status,
+
+    #[serde(default)]
+    pub due: Option<String>,
+
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    pub importance: i32,
+
+    pub created_at: String,
+    pub updated_at: String,
+
+    #[serde(default)]
+    pub done_at: Option<String>,
+
+    /// archive等から戻したときの元パス記録（任意）
+    #[serde(default)]
+    pub restored_from: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TodoFile {
+    pub path: std::path::PathBuf,
+    pub fm: FrontMatter,
+    pub body: String,
+}
+
+impl TodoFile {
+    pub fn short_id(&self) -> String {
+        self.fm.id.chars().take(12).collect()
+    }
+
+    pub fn append_log_line(&mut self, date: &str, message: &str) {
+        let line = format!("- {}: {}\n", date, message);
+
+        if !self.body.contains("\n## ログ") && !self.body.starts_with("## ログ") {
+            if !self.body.ends_with('\n') {
+                self.body.push('\n');
+            }
+            self.body.push_str("\n## ログ\n");
+            self.body.push_str(&line);
+            return;
+        }
+
+        if self.body.starts_with("## ログ") {
+            if let Some(pos) = self.body.find('\n') {
+                self.body.insert_str(pos + 1, &line);
+            } else {
+                self.body.push('\n');
+                self.body.push_str(&line);
+            }
+            return;
+        }
+
+        if let Some(h) = self.body.find("\n## ログ") {
+            let from = h + 1;
+            let after_header = if let Some(eol) = self.body[from..].find('\n') {
+                from + eol + 1
+            } else {
+                self.body.push('\n');
+                self.body.len()
+            };
+            self.body.insert_str(after_header, &line);
+            return;
+        }
+
+        if !self.body.ends_with('\n') {
+            self.body.push('\n');
+        }
+        self.body.push_str(&line);
+    }
+}
+```
+
+---
+
+## src/frontmatter.rs
+
+```rust
+use anyhow::{anyhow, Result};
+use crate::model::{FrontMatter, TodoFile};
+
+pub fn parse_todo_file(path: std::path::PathBuf, text: &str) -> Result<TodoFile> {
+    let (fm_str, body) = split_frontmatter(text)?;
+    let fm: FrontMatter = serde_yaml::from_str(&fm_str)
+        .map_err(|e| anyhow!("YAML parse error in {}: {}", path.display(), e))?;
+    Ok(TodoFile { path, fm, body })
+}
+
+pub fn render_todo_file(fm: &FrontMatter, body: &str) -> Result<String> {
+    let yaml = serde_yaml::to_string(fm)?;
+    Ok(format!("---\n{}---\n{}", yaml, body.trim_start_matches('\n')))
+}
+
+fn split_frontmatter(text: &str) -> Result<(String, String)> {
+    let mut lines = text.lines();
+
+    if lines.next() != Some("---") {
+        return Err(anyhow!("missing frontmatter start '---'"));
+    }
+
+    let mut yaml_lines = Vec::new();
+    for line in lines.by_ref() {
+        if line == "---" {
+            break;
+        }
+        yaml_lines.push(line);
+    }
+
+    let yaml = yaml_lines.join("\n");
+    let body = lines.collect::<Vec<_>>().join("\n");
+
+    Ok((yaml, body))
+}
+```
+
+---
+
+## src/format.rs
+
+```rust
+use chrono::{DateTime, Duration, FixedOffset, Local};
+use crate::model::TodoFile;
+use crate::store::parse_due_dt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Label {
+    Overdue,
+    Today,
+    Soon,
+    None,
+    NoDue,
+}
+
+pub fn label_for(todo: &TodoFile, soon_days: i64) -> Label {
+    let now = Local::now();
+    let now_fixed: DateTime<FixedOffset> = now.with_timezone(now.offset());
+
+    let Some(due_str) = todo.fm.due.as_deref() else { return Label::NoDue; };
+    let Some(due_dt) = parse_due_dt(due_str) else { return Label::None; };
+
+    if due_dt < now_fixed { return Label::Overdue; }
+
+    let due_local = due_dt.with_timezone(now.offset());
+    if due_local.date_naive() == now.date_naive() { return Label::Today; }
+
+    let soon_limit = now_fixed + Duration::days(soon_days);
+    if due_dt <= soon_limit { return Label::Soon; }
+
+    Label::None
+}
+
+pub fn label_str(l: Label) -> &'static str {
+    match l {
+        Label::Overdue => "OVERDUE",
+        Label::Today => "TODAY",
+        Label::Soon => "SOON",
+        Label::NoDue => "NO DUE",
+        Label::None => "",
+    }
+}
+
+fn color(s: &str, code: &str, enable: bool) -> String {
+    if !enable { return s.to_string(); }
+    format!("\x1b[{}m{}\x1b[0m", code, s)
+}
+
+pub fn label_colored(l: Label, enable: bool) -> String {
+    let s = label_str(l);
+    match l {
+        Label::Overdue => color(s, "31;1", enable),
+        Label::Today => color(s, "33;1", enable),
+        Label::Soon => color(s, "36;1", enable),
+        Label::NoDue => color(s, "90", enable),
+        Label::None => s.to_string(),
+    }
+}
+
+pub fn due_display(todo: &TodoFile) -> String {
+    match todo.fm.due.as_deref() {
+        None => "----".to_string(),
+        Some(s) => {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                return d.format("%Y-%m-%d").to_string();
+            }
+            if let Some(dt) = parse_due_dt(s) {
+                return dt.date_naive().format("%Y-%m-%d").to_string();
+            }
+            s.to_string()
+        }
+    }
+}
+
+pub fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars { return s.to_string(); }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+```
+
+---
+
+## src/store.rs
+
+```rust
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Datelike, FixedOffset, Local, NaiveDate};
+use walkdir::WalkDir;
+
+use crate::config::Config;
+use crate::frontmatter::{parse_todo_file, render_todo_file};
+use crate::model::{Status, TodoFile};
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+pub fn ensure_dirs(cfg: &Config) -> Result<()> {
+    std::fs::create_dir_all(cfg.active_dir())?;
+    std::fs::create_dir_all(cfg.done_dir())?;
+    std::fs::create_dir_all(cfg.canceled_dir())?;
+    std::fs::create_dir_all(cfg.templates_dir())?;
+    Ok(())
+}
+
+pub fn load_active(cfg: &Config) -> Result<Vec<TodoFile>> {
+    load_from_dir_recursive(&cfg.active_dir())
+}
+
+/// active + archived done/canceled (reopen対象)
+pub fn load_closed(cfg: &Config) -> Result<Vec<TodoFile>> {
+    let mut out = Vec::new();
+
+    // active配下に done/canceled が残っている場合にも対応
+    out.extend(load_from_dir_recursive(&cfg.active_dir())?);
+
+    // archive済み
+    out.extend(load_from_dir_recursive(&cfg.done_dir())?);
+    out.extend(load_from_dir_recursive(&cfg.canceled_dir())?);
+
+    out.retain(|t| matches!(t.fm.status, Status::Done | Status::Canceled));
+    Ok(out)
+}
+
+fn load_from_dir_recursive(dir: &std::path::Path) -> Result<Vec<TodoFile>> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+        let text = std::fs::read_to_string(entry.path())?;
+        let todo = parse_todo_file(entry.path().to_path_buf(), &text)?;
+        out.push(todo);
+    }
+    Ok(out)
+}
+
+/// Resolve id or prefix within ACTIVE directory.
+pub fn resolve_one(cfg: &Config, id_or_prefix: &str) -> Result<TodoFile> {
+    let list = load_active(cfg)?;
+    resolve_from_list(&list, id_or_prefix)
+}
+
+/// Resolve id or prefix within CLOSED set (active+archive done/canceled).
+pub fn resolve_one_closed(cfg: &Config, id_or_prefix: &str) -> Result<TodoFile> {
+    let list = load_closed(cfg)?;
+    resolve_from_list(&list, id_or_prefix)
+}
+
+fn resolve_from_list(list: &[TodoFile], id_or_prefix: &str) -> Result<TodoFile> {
+    let mut matches: Vec<TodoFile> = list
+        .iter()
+        .cloned()
+        .filter(|t| t.fm.id == id_or_prefix || t.fm.id.starts_with(id_or_prefix))
+        .collect();
+
+    if matches.is_empty() {
+        return Err(anyhow!("no match for: {}", id_or_prefix));
+    }
+    if matches.len() == 1 {
+        return Ok(matches.remove(0));
+    }
+
+    if let Some(selected) = fzf_select_todos(&matches) {
+        return Ok(selected);
+    }
+
+    let mut msg = String::from("multiple matches (use longer prefix or install fzf):\n");
+    for t in matches.iter().take(30) {
+        msg.push_str(&format!(
+            "  {}  [{}]  {}  ({})\n",
+            t.short_id(),
+            t.fm.importance,
+            t.fm.title,
+            t.fm.tags.join(",")
+        ));
+    }
+    Err(anyhow!(msg))
+}
+
+pub fn save(todo: &TodoFile) -> Result<()> {
+    let text = render_todo_file(&todo.fm, &todo.body)?;
+    std::fs::write(&todo.path, text)?;
+    Ok(())
+}
+
+pub fn now_jst_rfc3339() -> String {
+    Local::now().to_rfc3339()
+}
+
+/// Parse due string to DateTime<FixedOffset>
+/// - YYYY-MM-DD => 23:59:59 local time (JST)
+/// - RFC3339 => that datetime
+pub fn parse_due_dt(due: &str) -> Option<DateTime<FixedOffset>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(due) {
+        return Some(dt);
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(due, "%Y-%m-%d") {
+        let local_dt = Local
+            .from_local_datetime(&date.and_hms_opt(23, 59, 59)?)
+            .single()?;
+        return Some(local_dt.with_timezone(local_dt.offset()));
+    }
+    None
+}
+
+/// RFC3339 / YYYY-MM-DD をざっくり受けるパーサ（organize用）
+fn parse_any_dt(s: &str) -> Option<DateTime<FixedOffset>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt);
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let local_dt = Local
+            .from_local_datetime(&date.and_hms_opt(23, 59, 59)?)
+            .single()?;
+        return Some(local_dt.with_timezone(local_dt.offset()));
+    }
+    None
+}
+
+pub fn month_dir(base: &std::path::Path, done_at: &str) -> Result<std::path::PathBuf> {
+    let dt = DateTime::parse_from_rfc3339(done_at)
+        .map_err(|_| anyhow!("invalid done_at: {}", done_at))?;
+    Ok(base
+        .join(format!("{:04}", dt.year()))
+        .join(format!("{:02}", dt.month())))
+}
+
+pub fn move_to_archive(cfg: &Config, todo: &TodoFile) -> Result<std::path::PathBuf> {
+    let done_at = todo
+        .fm
+        .done_at
+        .as_deref()
+        .ok_or_else(|| anyhow!("done_at missing"))?;
+
+    let base = match todo.fm.status {
+        Status::Done => cfg.done_dir(),
+        Status::Canceled => cfg.canceled_dir(),
+        _ => return Err(anyhow!("only done/canceled can be archived")),
+    };
+
+    let dest_dir = month_dir(&base, done_at)?;
+    std::fs::create_dir_all(&dest_dir)?;
+
+    let file_name = todo.path.file_name().ok_or_else(|| anyhow!("bad filename"))?;
+    let dest = dest_dir.join(file_name);
+
+    std::fs::rename(&todo.path, &dest)?;
+    Ok(dest)
+}
+
+fn has_cmd(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// fzf-select from ACTIVE todos (todo/doing/waiting)
+pub fn select_active_one_fzf(cfg: &Config) -> Result<Option<TodoFile>> {
+    let mut list = load_active(cfg)?;
+    list.retain(|t| t.fm.status.is_active());
+    if list.is_empty() {
+        return Ok(None);
+    }
+    Ok(fzf_select_todos(&list))
+}
+
+/// fzf-select from CLOSED todos (done/canceled) including archived
+pub fn select_closed_one_fzf(cfg: &Config) -> Result<Option<TodoFile>> {
+    let list = load_closed(cfg)?;
+    if list.is_empty() {
+        return Ok(None);
+    }
+    Ok(fzf_select_todos(&list))
+}
+
+/// Candidate format (TAB-delimited):
+///   1: id (hidden)
+///   2: display text (shown)
+///   3: path (for preview)
+/// fzf:
+/// - preview: bat/batcat or sed
+/// - Ctrl-O: open in $EDITOR (or nvim) without leaving fzf
+fn fzf_select_todos(matches: &[TodoFile]) -> Option<TodoFile> {
+    if !has_cmd("fzf") {
+        return None;
+    }
+
+    let use_bat = has_cmd("bat") || has_cmd("batcat");
+    let bat_cmd = if has_cmd("bat") { "bat" } else { "batcat" };
+
+    let mut lines = String::new();
+    for t in matches {
+        let due = t.fm.due.clone().unwrap_or_else(|| "----".to_string());
+        let tags = if t.fm.tags.is_empty() {
+            "".to_string()
+        } else {
+            format!(" ({})", t.fm.tags.join(","))
+        };
+        let display = format!(
+            "[{}] {} {}{}  {}",
+            t.fm.importance,
+            due,
+            t.fm.title,
+            tags,
+            t.path.display()
+        );
+        lines.push_str(&format!(
+            "{}\t{}\t{}\n",
+            t.fm.id,
+            display,
+            t.path.display()
+        ));
+    }
+
+    let preview = if use_bat {
+        format!("{bat_cmd} --style=numbers --color=always --line-range :200 {{3}}")
+    } else {
+        "sh -lc 'sed -n \"1,200p\" \"{3}\"'".to_string()
+    };
+
+    let bind_ctrl_o = "ctrl-o:execute-silent(sh -lc '${EDITOR:-nvim} \"{3}\"')";
+
+    let mut child = Command::new("fzf")
+        .args([
+            "--delimiter=\t",
+            "--with-nth=2",
+            "--prompt=todo> ",
+            "--height=40%",
+            "--reverse",
+            "--preview-window=right:60%:wrap",
+            "--preview",
+            &preview,
+            "--bind",
+            bind_ctrl_o,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    {
+        let stdin = child.stdin.as_mut()?;
+        stdin.write_all(lines.as_bytes()).ok()?;
+    }
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let selected = String::from_utf8_lossy(&output.stdout);
+    let selected_line = selected.lines().next()?.trim();
+    if selected_line.is_empty() {
+        return None;
+    }
+
+    let id = selected_line.split('\t').next()?.trim();
+    matches.iter().find(|t| t.fm.id == id).cloned()
+}
+
+fn move_file_avoiding_collision(src: &std::path::Path, dest_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dest_dir)?;
+
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| anyhow!("bad filename"))?
+        .to_owned();
+
+    let mut dest = dest_dir.join(&file_name);
+
+    if dest.exists() {
+        let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("todo");
+        let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("md");
+        for i in 1..=9999 {
+            let cand = dest_dir.join(format!("{}_{}.{}", stem, i, ext));
+            if !cand.exists() {
+                dest = cand;
+                break;
+            }
+        }
+    }
+
+    std::fs::rename(src, &dest)?;
+    Ok(dest)
+}
+
+fn quarantine_broken(root: &std::path::Path, path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let broken_dir = root.join("broken");
+    move_file_avoiding_collision(path, &broken_dir)
+}
+
+/// reopen用：active/ に戻し、さらに「新しいTS + slug」にリネーム
+pub fn move_to_active(cfg: &Config, todo: &TodoFile) -> Result<std::path::PathBuf> {
+    let active = cfg.active_dir();
+    std::fs::create_dir_all(&active)?;
+
+    let now_ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let slug_s = {
+        let s = slug::slugify(&todo.fm.title);
+        if s.is_empty() { "todo".to_string() } else { s }
+    };
+    let base_name = format!("{}__{}.md", now_ts, slug_s);
+
+    let mut dest = active.join(base_name);
+    if dest.exists() {
+        let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("todo");
+        let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("md");
+        for i in 1..=9999 {
+            let cand = active.join(format!("{}_{}.{}", stem, i, ext));
+            if !cand.exists() {
+                dest = cand;
+                break;
+            }
+        }
+    }
+
+    if todo.path.starts_with(&active) {
+        if todo.path != dest {
+            std::fs::rename(&todo.path, &dest)?;
+        }
+        return Ok(dest);
+    }
+
+    std::fs::rename(&todo.path, &dest)?;
+    Ok(dest)
+}
+
+/// archive等から active/ に戻す（ファイル名維持）＋ restored_from + 復旧ログ
+pub fn restore_to_active_preserve_name(cfg: &Config, todo: &TodoFile) -> Result<std::path::PathBuf> {
+    let active = cfg.active_dir();
+    std::fs::create_dir_all(&active)?;
+
+    if todo.path.starts_with(&active) {
+        return Ok(todo.path.clone());
+    }
+
+    let src_str = todo.path.display().to_string();
+    let dest = move_file_avoiding_collision(&todo.path, &active)?;
+
+    if let Ok(text) = std::fs::read_to_string(&dest) {
+        if let Ok(mut tf) = parse_todo_file(dest.clone(), &text) {
+            let date = Local::now().format("%Y-%m-%d").to_string();
+            tf.fm.updated_at = now_jst_rfc3339();
+            tf.fm.restored_from = Some(src_str);
+            tf.append_log_line(&date, "restored from archive");
+            save(&tf)?;
+        }
+    }
+
+    Ok(dest)
+}
+
+/// statusに応じて「正しい配置先」に置く（FixBroken/Archive organize用）
+/// - active status => activeへ（ファイル名維持、restored_from/ログ追加）
+/// - done/canceled => done/canceled の YYYY/MM（dtは done_at -> updated_at -> created_at から推定）
+/// - 日付が取れない => unknown/
+/// 移動後、restored_from を記録（移動元パス）
+pub fn place_todo_by_status(cfg: &Config, todo: &TodoFile) -> Result<std::path::PathBuf> {
+    match todo.fm.status {
+        Status::Todo | Status::Doing | Status::Waiting => {
+            return restore_to_active_preserve_name(cfg, todo);
+        }
+        Status::Done | Status::Canceled => {}
+    }
+
+    let desired_root = match todo.fm.status {
+        Status::Done => cfg.done_dir(),
+        Status::Canceled => cfg.canceled_dir(),
+        _ => unreachable!(),
+    };
+
+    let dt_source = todo
+        .fm
+        .done_at
+        .as_deref()
+        .or(Some(todo.fm.updated_at.as_str()))
+        .or(Some(todo.fm.created_at.as_str()));
+
+    let dest_dir = if let Some(s) = dt_source {
+        if let Some(dt) = parse_any_dt(s) {
+            desired_root
+                .join(format!("{:04}", dt.year()))
+                .join(format!("{:02}", dt.month()))
+        } else {
+            desired_root.join("unknown")
+        }
+    } else {
+        desired_root.join("unknown")
+    };
+
+    let src_str = todo.path.display().to_string();
+    let dest = move_file_avoiding_collision(&todo.path, &dest_dir)?;
+
+    if let Ok(text) = std::fs::read_to_string(&dest) {
+        if let Ok(mut tf) = parse_todo_file(dest.clone(), &text) {
+            tf.fm.updated_at = now_jst_rfc3339();
+            tf.fm.restored_from = Some(src_str);
+            save(&tf)?;
+        }
+    }
+
+    Ok(dest)
+}
+
+/// archive 整理：done/ と canceled/ を走査し、
+/// - 壊れていれば broken/
+/// - active status なら active へ復旧（ログ+restored_from）
+/// - done/canceled は statusに従って YYYY/MM or unknown へ
+pub fn organize_archive(cfg: &Config) -> Result<usize> {
+    let mut moved = 0;
+    moved += organize_archive_root(cfg, &cfg.done_dir())?;
+    moved += organize_archive_root(cfg, &cfg.canceled_dir())?;
+    Ok(moved)
+}
+
+fn organize_archive_root(cfg: &Config, root: &std::path::Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut moved = 0;
+
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+
+        let path = entry.path().to_path_buf();
+
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => {
+                quarantine_broken(root, &path)?;
+                moved += 1;
+                continue;
+            }
+        };
+
+        let todo = match parse_todo_file(path.clone(), &text) {
+            Ok(t) => t,
+            Err(_) => {
+                quarantine_broken(root, &path)?;
+                moved += 1;
+                continue;
+            }
+        };
+
+        place_todo_by_status(cfg, &todo)?;
+        moved += 1;
+    }
+
+    Ok(moved)
+}
+
+/// brokenファイル選択用（TodoFileにパースできないので Path だけ）
+pub fn select_broken_path_fzf(cfg: &Config) -> Result<Option<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    let done_broken = cfg.done_dir().join("broken");
+    let canceled_broken = cfg.canceled_dir().join("broken");
+
+    for d in [done_broken, canceled_broken] {
+        if !d.exists() { continue; }
+        for entry in WalkDir::new(d).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() { continue; }
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(fzf_select_paths(&paths))
+}
+
+fn fzf_select_paths(paths: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    if !has_cmd("fzf") {
+        return None;
+    }
+
+    let use_bat = has_cmd("bat") || has_cmd("batcat");
+    let bat_cmd = if has_cmd("bat") { "bat" } else { "batcat" };
+
+    let mut lines = String::new();
+    for p in paths {
+        lines.push_str(&format!("{}\n", p.display()));
+    }
+
+    let preview = if use_bat {
+        format!("{bat_cmd} --style=numbers --color=always --line-range :200 {{}}")
+    } else {
+        "sh -lc 'sed -n \"1,200p\" \"{}\"'".to_string()
+    };
+
+    let bind_ctrl_o = "ctrl-o:execute-silent(sh -lc '${EDITOR:-nvim} \"{}\"')";
+
+    let mut child = Command::new("fzf")
+        .args([
+            "--prompt=broken> ",
+            "--height=40%",
+            "--reverse",
+            "--preview-window=right:60%:wrap",
+            "--preview",
+            &preview,
+            "--bind",
+            bind_ctrl_o,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    {
+        let stdin = child.stdin.as_mut()?;
+        stdin.write_all(lines.as_bytes()).ok()?;
+    }
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let selected = String::from_utf8_lossy(&output.stdout);
+    let sel = selected.lines().next()?.trim();
+    if sel.is_empty() {
+        return None;
+    }
+
+    Some(std::path::PathBuf::from(sel))
+}
+```
+
+---
+
+## src/main.rs
+
+```rust
+mod cli;
+mod config;
+mod model;
+mod frontmatter;
+mod store;
+mod format;
+
+use anyhow::{anyhow, Result};
+use clap::Parser;
+use chrono::Local;
+use std::collections::HashSet;
+use std::process::Command;
+
+use cli::{Args, Cmd};
+use config::Config;
+use model::{FrontMatter, Status, TodoFile};
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let cfg = Config::load();
+    store::ensure_dirs(&cfg)?;
+
+    match args.cmd {
+        Cmd::Add { title, due, tags, importance, edit, slug } => {
+            cmd_add(&cfg, title, due, tags, importance, edit, slug)
+        }
+        Cmd::List { due_within, due_from, due_to, tag, status, importance, text, include_overdue } => {
+            cmd_list(&cfg, due_within, due_from, due_to, tag, status, importance, text, include_overdue)
+        }
+        Cmd::Show { id_or_prefix } => cmd_show(&cfg, &id_or_prefix),
+        Cmd::Edit { id_or_prefix } => cmd_edit(&cfg, &id_or_prefix),
+
+        Cmd::Start { id_or_prefix } => cmd_start(&cfg, id_or_prefix),
+        Cmd::Wait { id_or_prefix } => cmd_wait(&cfg, id_or_prefix),
+        Cmd::Done { id_or_prefix } => cmd_done(&cfg, id_or_prefix),
+        Cmd::Cancel { id_or_prefix } => cmd_cancel(&cfg, id_or_prefix),
+
+        Cmd::Reopen { id_or_prefix } => cmd_reopen(&cfg, id_or_prefix),
+
+        Cmd::Archive => cmd_archive(&cfg),
+
+        Cmd::FixBroken => cmd_fix_broken(&cfg),
+    }
+}
+
+fn cmd_add(
+    cfg: &Config,
+    title: Option<String>,
+    due: Option<String>,
+    tags: Vec<String>,
+    importance: i32,
+    edit: bool,
+    slug_opt: Option<String>,
+) -> Result<()> {
+    let now = Local::now().to_rfc3339();
+    let id = now.clone();
+
+    let file_ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let slug = slug_opt
+        .or_else(|| title.as_ref().map(|t| slug::slugify(t)))
+        .filter(|s| !s.is_empty());
+
+    let filename = if let Some(slug) = slug {
+        format!("{}__{}.md", file_ts, slug)
+    } else {
+        format!("{}.md", file_ts)
+    };
+
+    let path = cfg.active_dir().join(filename);
+
+    let mut body = String::from("\n## メモ\n\n## サブタスク\n- [ ] \n\n## ログ\n- :\n");
+
+    if cfg.template_path().exists() {
+        let tpl = std::fs::read_to_string(cfg.template_path())?;
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        let t = tpl
+            .replace("{{id}}", &id)
+            .replace("{{title}}", title.as_deref().unwrap_or(""))
+            .replace("{{now}}", &now)
+            .replace("{{date}}", &date);
+
+        let parsed = frontmatter::parse_todo_file(path.clone(), &t)?;
+        body = parsed.body;
+    }
+
+    let fm = FrontMatter {
+        id,
+        title: title.unwrap_or_default(),
+        status: Status::Todo,
+        due,
+        tags,
+        importance,
+        created_at: now.clone(),
+        updated_at: now,
+        done_at: None,
+        restored_from: None,
+    };
+
+    let todo = TodoFile { path: path.clone(), fm, body };
+    store::save(&todo)?;
+
+    if edit {
+        open_in_editor(cfg, &path)?;
+        cmd_touch_updated_at(&path)?;
+    } else {
+        println!("created: {}", path.display());
+    }
+    Ok(())
+}
+
+fn cmd_list(
+    cfg: &Config,
+    due_within: Option<String>,
+    due_from: Option<String>,
+    due_to: Option<String>,
+    tag: Option<String>,
+    status: Option<String>,
+    importance_expr: Option<String>,
+    text: Option<String>,
+    include_overdue: bool,
+) -> Result<()> {
+    let mut todos = store::load_active(cfg)?;
+    todos.retain(|t| t.fm.status.is_active());
+
+    if let Some(s) = status {
+        let want: Status = s.parse()?;
+        todos.retain(|t| t.fm.status == want);
+    }
+
+    if let Some(tag) = tag {
+        let tag = tag.to_lowercase();
+        todos.retain(|t| t.fm.tags.iter().any(|x| x.to_lowercase() == tag));
+    }
+
+    if let Some(expr) = importance_expr {
+        let (op, n) = parse_importance_expr(&expr)?;
+        todos.retain(|t| compare_i32(t.fm.importance, op, n));
+    }
+
+    if let Some(q) = text {
+        if let Some(paths) = rg_paths(&cfg.active_dir(), &q) {
+            todos.retain(|t| paths.contains(&t.path));
+        } else {
+            let q = q.to_lowercase();
+            todos.retain(|t| t.fm.title.to_lowercase().contains(&q) || t.body.to_lowercase().contains(&q));
+        }
+    }
+
+    let now_fixed = Local::now().with_timezone(Local::now().offset());
+
+    if let Some(within) = due_within {
+        let days = parse_days(&within)?;
+        let end = now_fixed + chrono::Duration::days(days);
+        todos.retain(|t| {
+            let Some(due_str) = t.fm.due.as_deref() else { return false; };
+            let Some(due_dt) = store::parse_due_dt(due_str) else { return false; };
+            if !include_overdue && due_dt < now_fixed { return false; }
+            due_dt >= now_fixed && due_dt <= end
+        });
+    } else if due_from.is_some() || due_to.is_some() {
+        let from_dt = due_from.as_deref().and_then(store::parse_due_dt);
+        let to_dt = due_to.as_deref().and_then(store::parse_due_dt);
+        todos.retain(|t| {
+            let Some(due_str) = t.fm.due.as_deref() else { return false; };
+            let Some(due_dt) = store::parse_due_dt(due_str) else { return false; };
+            if let Some(f) = from_dt { if due_dt < f { return false; } }
+            if let Some(to) = to_dt { if due_dt > to { return false; } }
+            true
+        });
+    }
+
+    todos.sort_by(|a, b| {
+        use std::cmp::Ordering;
+
+        let a_due = a.fm.due.as_deref().and_then(store::parse_due_dt);
+        let b_due = b.fm.due.as_deref().and_then(store::parse_due_dt);
+
+        let a_over = a_due.map(|d| d < now_fixed).unwrap_or(false);
+        let b_over = b_due.map(|d| d < now_fixed).unwrap_or(false);
+
+        match (a_over, b_over) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            _ => {}
+        }
+
+        match (a_due, b_due) {
+            (Some(ad), Some(bd)) => if ad != bd { return ad.cmp(&bd); },
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => {}
+        }
+
+        if a.fm.importance != b.fm.importance {
+            return b.fm.importance.cmp(&a.fm.importance);
+        }
+
+        a.fm.id.cmp(&b.fm.id)
+    });
+
+    let enable_color = std::env::var("NO_COLOR").is_err();
+
+    for t in &todos {
+        let l = format::label_for(t, cfg.soon_days);
+        let lab = format::label_colored(l, enable_color);
+        let due = format::due_display(t);
+        let imp = format!("[{}]", t.fm.importance);
+        let title = format::truncate(&t.fm.title, 40);
+        let tags = if t.fm.tags.is_empty() { "".to_string() } else { format!(" ({})", t.fm.tags.join(",")) };
+
+        println!(
+            "{:<7} {:<10} {:<6} {:<12} {:<40}{}",
+            lab, due, imp, t.short_id(), title, tags
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_show(cfg: &Config, id_or_prefix: &str) -> Result<()> {
+    let todo = store::resolve_one(cfg, id_or_prefix)?;
+    let text = std::fs::read_to_string(&todo.path)?;
+    println!("{}", text);
+    Ok(())
+}
+
+fn cmd_edit(cfg: &Config, id_or_prefix: &str) -> Result<()> {
+    let todo = store::resolve_one(cfg, id_or_prefix)?;
+    let path = todo.path.clone();
+
+    open_in_editor(cfg, &path)?;
+    cmd_touch_updated_at(&path)?;
+
+    println!("updated: {}", path.display());
+    Ok(())
+}
+
+fn cmd_touch_updated_at(path: &std::path::Path) -> Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut edited = frontmatter::parse_todo_file(path.to_path_buf(), &text)?;
+    edited.fm.updated_at = store::now_jst_rfc3339();
+
+    if matches!(edited.fm.status, Status::Done | Status::Canceled) && edited.fm.done_at.is_none() {
+        edited.fm.done_at = Some(store::now_jst_rfc3339());
+    }
+
+    store::save(&edited)?;
+    Ok(())
+}
+
+fn pick_or_prefix(
+    cfg: &Config,
+    id_or_prefix: Option<String>,
+    selector: fn(&Config) -> Result<Option<TodoFile>>,
+) -> Result<Option<String>> {
+    if let Some(s) = id_or_prefix {
+        return Ok(Some(s));
+    }
+    if let Some(todo) = selector(cfg)? {
+        return Ok(Some(todo.fm.id));
+    }
+    Ok(None)
+}
+
+fn cmd_start(cfg: &Config, id_or_prefix: Option<String>) -> Result<()> {
+    if let Some(id) = pick_or_prefix(cfg, id_or_prefix, store::select_active_one_fzf)? {
+        return cmd_set_status(cfg, &id, Status::Doing);
+    }
+    println!("no selection (fzf not available / canceled / no candidates)");
+    Ok(())
+}
+
+fn cmd_wait(cfg: &Config, id_or_prefix: Option<String>) -> Result<()> {
+    if let Some(id) = pick_or_prefix(cfg, id_or_prefix, store::select_active_one_fzf)? {
+        return cmd_set_status(cfg, &id, Status::Waiting);
+    }
+    println!("no selection (fzf not available / canceled / no candidates)");
+    Ok(())
+}
+
+fn cmd_done(cfg: &Config, id_or_prefix: Option<String>) -> Result<()> {
+    if let Some(id) = pick_or_prefix(cfg, id_or_prefix, store::select_active_one_fzf)? {
+        return cmd_set_status(cfg, &id, Status::Done);
+    }
+    println!("no selection (fzf not available / canceled / no candidates)");
+    Ok(())
+}
+
+fn cmd_cancel(cfg: &Config, id_or_prefix: Option<String>) -> Result<()> {
+    if let Some(id) = pick_or_prefix(cfg, id_or_prefix, store::select_active_one_fzf)? {
+        return cmd_set_status(cfg, &id, Status::Canceled);
+    }
+    println!("no selection (fzf not available / canceled / no candidates)");
+    Ok(())
+}
+
+/// reopen:
+/// - 引数あり/なしで closed(done/canceled)から取得（archive含む）
+/// - active/ に戻してリネーム（TS+slug）
+/// - restored_from を記録
+fn cmd_reopen(cfg: &Config, id_or_prefix: Option<String>) -> Result<()> {
+    let mut todo = if let Some(s) = id_or_prefix {
+        store::resolve_one_closed(cfg, &s)?
+    } else {
+        match store::select_closed_one_fzf(cfg)? {
+            Some(t) => t,
+            None => {
+                println!("no selection (fzf not available / canceled / no closed todos)");
+                return Ok(());
+            }
+        }
+    };
+
+    if !matches!(todo.fm.status, Status::Done | Status::Canceled) {
+        anyhow::bail!(
+            "reopen is only allowed for status done/canceled, but got: {}",
+            todo.fm.status.as_str()
+        );
+    }
+
+    let src_str = todo.path.display().to_string();
+
+    let new_path = store::move_to_active(cfg, &todo)?;
+    todo.path = new_path;
+
+    let now = store::now_jst_rfc3339();
+    let date = Local::now().format("%Y-%m-%d").to_string();
+
+    let prev = todo.fm.status.clone();
+    let next = Status::Todo;
+
+    todo.fm.status = next.clone();
+    todo.fm.updated_at = now;
+    todo.fm.done_at = None;
+    todo.fm.restored_from = Some(src_str);
+
+    let msg = format!("reopen (status {} -> {})", prev.as_str(), next.as_str());
+    todo.append_log_line(&date, &msg);
+
+    store::save(&todo)?;
+    println!("reopened: {}", todo.path.display());
+    Ok(())
+}
+
+fn cmd_set_status(cfg: &Config, id_or_prefix: &str, status: Status) -> Result<()> {
+    let mut todo = store::resolve_one(cfg, id_or_prefix)?;
+    let now = store::now_jst_rfc3339();
+    let date = Local::now().format("%Y-%m-%d").to_string();
+
+    let prev = todo.fm.status.clone();
+
+    todo.fm.status = status.clone();
+    todo.fm.updated_at = now.clone();
+
+    match status {
+        Status::Done | Status::Canceled => todo.fm.done_at = Some(now.clone()),
+        Status::Todo | Status::Doing | Status::Waiting => todo.fm.done_at = None,
+    }
+
+    let action = match (&prev, &status) {
+        (Status::Todo, Status::Doing) => "start",
+        (_, Status::Doing) => "set doing",
+        (_, Status::Waiting) => "set waiting",
+        (_, Status::Done) => "done",
+        (_, Status::Canceled) => "canceled",
+        (_, Status::Todo) => "reopen",
+    };
+
+    let msg = format!("{} (status {} -> {})", action, prev.as_str(), status.as_str());
+    todo.append_log_line(&date, &msg);
+
+    store::save(&todo)?;
+
+    if cfg.auto_archive && matches!(todo.fm.status, Status::Done | Status::Canceled) {
+        let dest = store::move_to_archive(cfg, &todo)?;
+        println!("archived: {}", dest.display());
+    } else {
+        println!("updated: {}", todo.path.display());
+    }
+
+    Ok(())
+}
+
+fn cmd_archive(cfg: &Config) -> Result<()> {
+    // 1) active/ の done/canceled を archive へ
+    let todos = store::load_active(cfg)?;
+    let mut moved_from_active = 0;
+
+    for t in todos {
+        if matches!(t.fm.status, Status::Done | Status::Canceled) && t.fm.done_at.is_some() {
+            store::move_to_archive(cfg, &t)?;
+            moved_from_active += 1;
+        }
+    }
+
+    // 2) archive 内を整理（statusズレ修正、active復旧、broken隔離、YYYY/MM整形）
+    let reorganized = store::organize_archive(cfg)?;
+
+    println!(
+        "archived {} file(s) from active, reorganized {} file(s) in archive",
+        moved_from_active, reorganized
+    );
+    Ok(())
+}
+
+/// done/broken と canceled/broken から選んで修復
+fn cmd_fix_broken(cfg: &Config) -> Result<()> {
+    let Some(path) = store::select_broken_path_fzf(cfg)? else {
+        println!("no broken files (or fzf not available / canceled)");
+        return Ok(());
+    };
+
+    open_in_editor(cfg, &path)?;
+
+    let text = std::fs::read_to_string(&path)?;
+    let todo = match frontmatter::parse_todo_file(path.clone(), &text) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("still broken: {} ({})", path.display(), e);
+            return Ok(());
+        }
+    };
+
+    let dest = store::place_todo_by_status(cfg, &todo)?;
+    println!("fixed and placed: {}", dest.display());
+    Ok(())
+}
+
+fn open_in_editor(cfg: &Config, path: &std::path::Path) -> Result<()> {
+    let editor = &cfg.editor;
+    let status = Command::new(editor)
+        .arg(path)
+        .status()
+        .map_err(|e| anyhow!("failed to launch editor '{}': {}", editor, e))?;
+    if !status.success() {
+        return Err(anyhow!("editor exited with non-zero status"));
+    }
+    Ok(())
+}
+
+fn parse_days(s: &str) -> Result<i64> {
+    let s = s.trim().to_lowercase();
+    if let Some(num) = s.strip_suffix('d') {
+        return Ok(num.parse::<i64>()?);
+    }
+    Err(anyhow!("invalid duration: {} (use like 14d)", s))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Op { Eq, Gt, Ge, Lt, Le }
+
+fn parse_importance_expr(s: &str) -> Result<(Op, i32)> {
+    let s = s.trim();
+    for (p, op) in [
+        (">=", Op::Ge),
+        ("<=", Op::Le),
+        (">", Op::Gt),
+        ("<", Op::Lt),
+        ("=", Op::Eq),
+    ] {
+        if let Some(rest) = s.strip_prefix(p) {
+            return Ok((op, rest.trim().parse()?));
+        }
+    }
+    Ok((Op::Eq, s.parse()?))
+}
+
+fn compare_i32(v: i32, op: Op, n: i32) -> bool {
+    match op {
+        Op::Eq => v == n,
+        Op::Gt => v > n,
+        Op::Ge => v >= n,
+        Op::Lt => v < n,
+        Op::Le => v <= n,
+    }
+}
+
+fn rg_paths(dir: &std::path::Path, query: &str) -> Option<HashSet<std::path::PathBuf>> {
+    let out = Command::new("rg")
+        .arg("-l")
+        .arg(query)
+        .arg(dir)
+        .output()
+        .ok()?;
+
+    if !out.status.success() { return None; }
+
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut set = HashSet::new();
+    for line in s.lines() {
+        let p = line.trim();
+        if !p.is_empty() {
+            set.insert(std::path::PathBuf::from(p));
+        }
+    }
+    Some(set)
+}
+```
+
+---
+
+# ✅ 使い方の詳細まとめ
+
+## ディレクトリ構成
+
+デフォルトは `~/todo/`。
+
+* `active/`：作業中（todo/doing/waiting）
+* `done/YYYY/MM/`：完了（done）
+* `canceled/YYYY/MM/`：中止（canceled）
+* `done/unknown/` / `canceled/unknown/`：日付が取れない完了/中止
+* `done/broken/` / `canceled/broken/`：壊れたMarkdown（frontmatter不正など）
+* `templates/`：テンプレ置き場
+
+---
+
+## 1ファイル=1TODO、ファイル名
+
+* 新規作成は `YYYYMMDDhhmmss__slug.md`（slugはタイトル由来）
+* `reopen` すると **必ず** `active/` に戻り、**新しいTS+slugでリネーム**される
+
+---
+
+## frontmatter（YAML）
+
+最終的に使っているのはこの構造（互換でOK）：
+
+```yaml
+---
+id: "2025-12-31T01:23:45+09:00"
+title: "..."
+status: todo|doing|waiting|done|canceled
+due: "2026-01-10"  # or RFC3339
+tags: ["work","mail"]
+importance: 3
+created_at: "..."
+updated_at: "..."
+done_at: "..."              # done/canceledのとき
+restored_from: "/path/..."  # archive復旧やreopenなど移動時
+---
+```
+
+---
+
+## fzf の挙動（超重要）
+
+### fzfが起動する場面
+
+* `todo done` / `todo start` / `todo wait` / `todo cancel` / `todo reopen` を **引数なし**で実行
+* prefix指定で候補が複数ある（例：`todo edit 2025-12-31T01`）
+
+### fzf中の操作
+
+* Enter：選択確定
+* **Ctrl-O**：選択中ファイルを `$EDITOR`（なければ nvim）で開く
+* 右側プレビュー：
+
+  * `bat`/`batcat` があれば色付き＋行番号
+  * 無ければ `sed -n 1,200p` で簡易表示
+
+---
+
+## 基本コマンド
+
+### 新規作成
+
+```bash
+todo add "買い物" --due 2026-01-05 --tags home,errand --importance 2
+todo add "設計レビュー" --edit
+```
+
+### 一覧（締切・重要度で実用的にフィルタ）
+
+```bash
+todo list
+todo list --due-within 14d
+todo list --due-within 14d --include-overdue
+todo list --tag work
+todo list --importance ">=4"
+todo list --text "k8s"
+```
+
+### 編集・表示（prefix指定可）
+
+```bash
+todo show 2025-12-31T01
+todo edit 2025-12-31T01
+```
+
+### 状態変更（引数なしで即fzf）
+
+```bash
+todo start           # doingへ（activeからfzf）
+todo wait            # waitingへ（activeからfzf）
+todo done            # doneへ（activeからfzf）
+todo cancel          # canceledへ（activeからfzf）
+todo reopen          # done/canceledからfzf（archive含む）→ activeへ戻す＋リネーム
+```
+
+prefix指定もOK：
+
+```bash
+todo done 2025-12-31T01
+todo reopen 2025-12-20T09
+```
+
+※ `reopen <prefix>` は **done/canceled以外を拒否**。
+
+---
+
+## archive（整理が強い）
+
+```bash
+todo archive
+```
+
+これ1回でやること：
+
+1. `active/` の `done/canceled` を `done|canceled/YYYY/MM/` に移動
+2. `done/` `canceled/` の中身を総点検し、
+
+   * statusがズレてたら正しいrootへ
+   * done_atが無ければ updated_at→created_at を代用して YYYY/MM
+   * 日付取れない → unknown/
+   * 壊れてる → broken/
+   * `status: todo/doing/waiting` が紛れてたら **activeへ復旧（ログ追記＋restored_from）**
+
+---
+
+## broken 修復
+
+```bash
+todo fix-broken
+```
+
+* `done/broken/` と `canceled/broken/` を fzf で選択（プレビュー付き）
+* `$EDITOR` で直す
+* 直ったら自動で「statusに応じて正しい場所」へ配置
+
+  * active status → active（ログ+restored_from）
+  * done/canceled → YYYY/MM or unknown（restored_from）
+
+---
+
+# 補足：おすすめ設定（任意）
+
+`~/.config/todo/config.toml` を作ると便利：
+
+```toml
+root_dir = "/home/you/todo"
+soon_days = 7
+editor = "nvim"
+archive = true
+auto_archive = false
+```
+
+---
+
+必要なら次は「`todo fix-broken` を連続処理（直したら次へ）」とか、「`todo list` を `--json` 出力」も、今の設計のまま素直に拡張できます。
