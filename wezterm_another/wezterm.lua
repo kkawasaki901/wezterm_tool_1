@@ -3,15 +3,52 @@ local mux = wezterm.mux
 
 local config = {}
 
--- ===== 見た目（ここだけ） =====
--- config.window_background_opacity = 0.85
--- config.text_background_opacity = 0.85
-config.color_scheme = 'Tokyo Night Storm'
+-- ====== 小さい部品（ここだけ覚えればOK） ======
+local function Img(path, opt)
+  opt = opt or {}
+  return {
+    source = { File = path },
+    horizontal_align = opt.horizontal_align or "Center",
+    vertical_align   = opt.vertical_align   or "Middle",
+  }
+end
 
--- config.window_background_image = "G:/マイドライブ/picture/原神/1703016642252.jpg"
--- config.window_background_image_hsb = {
-	-- brightness = 0.25,
--- }
+local function Film(color, opacity, opt)
+  opt = opt or {}
+  return {
+    source = { Color = color },
+    opacity = opacity,
+
+    -- 画像の端が見える/隙間が出るのを防ぐ定番
+    width  = opt.width  or "120%",
+    height = opt.height or "120%",
+    horizontal_offset = opt.horizontal_offset or "-10%",
+    vertical_offset   = opt.vertical_offset   or "-10%",
+  }
+end
+
+-- ====== ここから設定（読みやすい） ======
+local BG_IMG = "G:/マイドライブ/picture/原神/1703016642252.jpg"
+local OVERLAY_COLOR = "#0b1020"
+local OVERLAY_OPACITY = 0.96
+
+config.background = {
+  Img(BG_IMG),
+  Film(OVERLAY_COLOR, OVERLAY_OPACITY),
+}
+
+-- Windowsならガラス化を避けるのに安全
+config.window_background_opacity = 1.0
+config.text_background_opacity = 1.0
+
+
+config.keys = {
+  {
+    key = 'Z',
+    mods = 'CTRL',
+    action = wezterm.action.TogglePaneZoomState,
+  },
+}
 
 -- ===== 初期レイアウト =====
 wezterm.on("gui-startup", function(cmd)
