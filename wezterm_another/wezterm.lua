@@ -30,7 +30,7 @@ end
 -- ====== ここから設定（読みやすい） ======
 local BG_IMG = "G:/マイドライブ/picture/原神/1703016642252.jpg"
 local OVERLAY_COLOR = "#0b1020"
-local OVERLAY_OPACITY = 0.96
+local OVERLAY_OPACITY = 0.92
 
 config.background = {
   Img(BG_IMG),
