@@ -2,6 +2,12 @@
 個人的に業務効率化ツールとして作ったものです。
 ターミナルをペインで分割してそれぞれでエディタを起動したり、TODO管理のCLIツールを起動したり、端っこで英単語を表示しておいてこまめに英語の勉強ができるようにしたりしたものです。自分用の備忘録も兼ねて公開します。
 
+<img width="1907" height="1017" alt="image" src="https://github.com/user-attachments/assets/8d0fc159-d9a7-47ba-9944-c21880b4453b" />
+
+<img width="1919" height="1017" alt="image" src="https://github.com/user-attachments/assets/3dc6457e-85a0-4a21-a9b4-f095cb224418" />
+
+
+
 ## 使い方
 ### Goの英単語表示CLI
 ビルドをして適当な場所において、パスを通してください。
